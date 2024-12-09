@@ -7,12 +7,30 @@ import uuid
 import re
 from datetime import datetime
 from pathlib import Path
+import tempfile
 
 app = FastAPI(title="yt-dlp API")
 
 # Configuration
 DOWNLOADS_DIR = os.getenv('DOWNLOADS_DIR', '/tmp/downloads')
 COOKIES_CONTENT = os.getenv('YOUTUBE_COOKIES')
+
+def create_temp_cookies_file():
+    """Create a temporary file with cookies content"""
+    if not COOKIES_CONTENT:
+        raise HTTPException(
+            status_code=500,
+            detail="YouTube cookies not configured. Please set YOUTUBE_COOKIES environment variable."
+        )
+    
+    # Create a temporary file
+    temp_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt')
+    try:
+        temp_file.write(COOKIES_CONTENT)
+        temp_file.flush()
+        return temp_file.name
+    finally:
+        temp_file.close()
 
 def verify_cookies():
     """Verify if cookies are configured"""
@@ -21,7 +39,7 @@ def verify_cookies():
             status_code=500,
             detail="YouTube cookies not configured. Please set YOUTUBE_COOKIES environment variable."
         )
-    return COOKIES_CONTENT
+    return create_temp_cookies_file()
 
 def create_safe_filename(title: str) -> str:
     # Remove special characters and spaces
@@ -36,7 +54,7 @@ def create_safe_filename(title: str) -> str:
 
 def get_yt_dlp_options(base_filename: str, format: str, quality: str) -> dict:
     """Create yt-dlp options with cookies from environment"""
-    verify_cookies()  # Ensure cookies are configured
+    cookies_file = verify_cookies()  # Get path to temporary cookies file
     
     return {
         'format': 'bestaudio/best',
@@ -47,7 +65,7 @@ def get_yt_dlp_options(base_filename: str, format: str, quality: str) -> dict:
         'extractaudio': True,
         'audioformat': format,
         'audioquality': quality,
-        'cookies': COOKIES_CONTENT,  # Pass cookies content directly
+        'cookiesfile': cookies_file,  # Use the temporary cookies file
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': format,
