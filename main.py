@@ -11,23 +11,17 @@ from pathlib import Path
 app = FastAPI(title="yt-dlp API")
 
 # Configuration
-COOKIES_FILE = "cookies.txt"
-DOWNLOADS_DIR = "downloads"
+DOWNLOADS_DIR = os.getenv('DOWNLOADS_DIR', '/tmp/downloads')
+COOKIES_CONTENT = os.getenv('YOUTUBE_COOKIES')
 
 def verify_cookies():
-    """Verify if cookies file exists and is readable"""
-    cookies_path = Path(COOKIES_FILE)
-    if not cookies_path.exists():
+    """Verify if cookies are configured"""
+    if not COOKIES_CONTENT:
         raise HTTPException(
             status_code=500,
-            detail="Cookies file not found. Please configure cookies.txt"
+            detail="YouTube cookies not configured. Please set YOUTUBE_COOKIES environment variable."
         )
-    if not os.access(cookies_path, os.R_OK):
-        raise HTTPException(
-            status_code=500,
-            detail="Cookies file is not readable. Please check permissions"
-        )
-    return str(cookies_path.absolute())
+    return COOKIES_CONTENT
 
 def create_safe_filename(title: str) -> str:
     # Remove special characters and spaces
@@ -41,8 +35,8 @@ def create_safe_filename(title: str) -> str:
     return f"{timestamp}_{safe_title}_{unique_id}"
 
 def get_yt_dlp_options(base_filename: str, format: str, quality: str) -> dict:
-    """Create yt-dlp options with proper cookie handling"""
-    cookies_path = verify_cookies()
+    """Create yt-dlp options with cookies from environment"""
+    verify_cookies()  # Ensure cookies are configured
     
     return {
         'format': 'bestaudio/best',
@@ -53,7 +47,7 @@ def get_yt_dlp_options(base_filename: str, format: str, quality: str) -> dict:
         'extractaudio': True,
         'audioformat': format,
         'audioquality': quality,
-        'cookiesfile': cookies_path,
+        'cookies': COOKIES_CONTENT,  # Pass cookies content directly
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': format,
@@ -76,7 +70,7 @@ async def download_audio(
         
         # First try to get video info
         options = get_yt_dlp_options("", format, quality)
-        with yt_dlp.YoutubeDL({'quiet': True, 'cookiesfile': options['cookiesfile']}) as ydl:
+        with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
             base_filename = create_safe_filename(info["title"])
             final_filename = f"{base_filename}.{format}"
@@ -114,10 +108,44 @@ async def download_audio(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.get("/download/{filename}")
+async def get_file(filename: str):
+    possible_paths = [
+        os.path.join(DOWNLOADS_DIR, filename),
+        os.path.join(DOWNLOADS_DIR, f"{filename}.{filename.split('.')[-1]}"),
+        os.path.join(DOWNLOADS_DIR, filename.replace('.mp3.mp3', '.mp3'))
+    ]
+    
+    for file_path in possible_paths:
+        if os.path.exists(file_path):
+            return FileResponse(
+                path=file_path,
+                filename=filename.replace('.mp3.mp3', '.mp3'),
+                media_type='audio/mpeg'
+            )
+    
+    raise HTTPException(status_code=404, detail=f"File not found. Tried paths: {possible_paths}")
+
+@app.get("/downloads")
+async def list_downloads():
+    if not os.path.exists(DOWNLOADS_DIR):
+        return {"files": []}
+    
+    files = []
+    for filename in os.listdir(DOWNLOADS_DIR):
+        file_path = os.path.join(DOWNLOADS_DIR, filename)
+        files.append({
+            "filename": filename,
+            "size": os.path.getsize(file_path),
+            "download_url": f"/download/{filename}"
+        })
+    
+    return {"files": files}
+
 @app.get("/info")
 async def get_video_info(url: str):
     try:
-        options = {'quiet': True, 'cookiesfile': verify_cookies()}
+        options = get_yt_dlp_options("", "mp3", "192")  # Default format and quality for info
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
             return {
@@ -139,3 +167,12 @@ async def get_video_info(url: str):
             }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "cookies_configured": bool(COOKIES_CONTENT),
+        "downloads_dir": DOWNLOADS_DIR
+    }
