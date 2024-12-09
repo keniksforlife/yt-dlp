@@ -6,8 +6,28 @@ import os
 import uuid
 import re
 from datetime import datetime
+from pathlib import Path
 
 app = FastAPI(title="yt-dlp API")
+
+# Configuration
+COOKIES_FILE = "cookies.txt"
+DOWNLOADS_DIR = "downloads"
+
+def verify_cookies():
+    """Verify if cookies file exists and is readable"""
+    cookies_path = Path(COOKIES_FILE)
+    if not cookies_path.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="Cookies file not found. Please configure cookies.txt"
+        )
+    if not os.access(cookies_path, os.R_OK):
+        raise HTTPException(
+            status_code=500,
+            detail="Cookies file is not readable. Please check permissions"
+        )
+    return str(cookies_path.absolute())
 
 def create_safe_filename(title: str) -> str:
     # Remove special characters and spaces
@@ -20,6 +40,30 @@ def create_safe_filename(title: str) -> str:
     
     return f"{timestamp}_{safe_title}_{unique_id}"
 
+def get_yt_dlp_options(base_filename: str, format: str, quality: str) -> dict:
+    """Create yt-dlp options with proper cookie handling"""
+    cookies_path = verify_cookies()
+    
+    return {
+        'format': 'bestaudio/best',
+        'outtmpl': f'{DOWNLOADS_DIR}/{base_filename}.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+        'nocheckcertificate': True,
+        'extractaudio': True,
+        'audioformat': format,
+        'audioquality': quality,
+        'cookiesfile': cookies_path,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': format,
+            'preferredquality': quality,
+        }],
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+    }
+
 @app.post("/download/audio")
 async def download_audio(
     url: str,
@@ -27,40 +71,28 @@ async def download_audio(
     quality: str = Query("192", description="Audio quality in kbps")
 ):
     try:
-        # Generate base filename without extension
-        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+        # Ensure downloads directory exists
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+        
+        # First try to get video info
+        options = get_yt_dlp_options("", format, quality)
+        with yt_dlp.YoutubeDL({'quiet': True, 'cookiesfile': options['cookiesfile']}) as ydl:
             info = ydl.extract_info(url, download=False)
             base_filename = create_safe_filename(info["title"])
             final_filename = f"{base_filename}.{format}"
             
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': f'downloads/{base_filename}.%(ext)s',  # Let yt-dlp handle extension
-            'quiet': True,
-            'no_warnings': True,
-            'nocheckcertificate': True,
-            'extractaudio': True,
-            'audioformat': format,
-            'audioquality': quality,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': format,
-                'preferredquality': quality,
-            }],
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-        }
+        # Update options with the filename
+        options = get_yt_dlp_options(base_filename, format, quality)
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # Perform download
+        with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
-            file_path = os.path.join('downloads', final_filename)
+            file_path = os.path.join(DOWNLOADS_DIR, final_filename)
             
-            # Check if file exists with potential double extension
+            # Handle potential double extension
             if not os.path.exists(file_path):
-                double_ext_path = os.path.join('downloads', f"{final_filename}.{format}")
+                double_ext_path = os.path.join(DOWNLOADS_DIR, f"{final_filename}.{format}")
                 if os.path.exists(double_ext_path):
-                    # Rename file to remove double extension
                     os.rename(double_ext_path, file_path)
             
             return {
@@ -72,50 +104,21 @@ async def download_audio(
                 "quality": quality,
                 "download_url": f"/download/{final_filename}"
             }
+    except yt_dlp.utils.DownloadError as e:
+        if "Sign in to confirm your age" in str(e):
+            raise HTTPException(
+                status_code=400,
+                detail="Age-restricted video. Please check your cookies configuration."
+            )
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/download/{filename}")
-async def get_file(filename: str):
-    # Try different possible file paths
-    possible_paths = [
-        os.path.join("downloads", filename),
-        os.path.join("downloads", f"{filename}.{filename.split('.')[-1]}"),
-        os.path.join("downloads", filename.replace('.mp3.mp3', '.mp3'))
-    ]
-    
-    for file_path in possible_paths:
-        if os.path.exists(file_path):
-            return FileResponse(
-                path=file_path,
-                filename=filename.replace('.mp3.mp3', '.mp3'),
-                media_type='audio/mpeg'
-            )
-    
-    raise HTTPException(status_code=404, detail=f"File not found. Tried paths: {possible_paths}")
-
-@app.get("/downloads")
-async def list_downloads():
-    downloads_dir = "downloads"
-    if not os.path.exists(downloads_dir):
-        return {"files": []}
-    
-    files = []
-    for filename in os.listdir(downloads_dir):
-        file_path = os.path.join(downloads_dir, filename)
-        files.append({
-            "filename": filename,
-            "size": os.path.getsize(file_path),
-            "download_url": f"/download/{filename}"
-        })
-    
-    return {"files": files}
-
 
 @app.get("/info")
 async def get_video_info(url: str):
     try:
-        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+        options = {'quiet': True, 'cookiesfile': verify_cookies()}
+        with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
             return {
                 "title": info["title"],
